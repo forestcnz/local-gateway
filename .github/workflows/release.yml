@@ -1,4 +1,4 @@
-# 推送 master 时自动构建三平台二进制并创建 GitHub Release
+# 推送 master 时自动构建多平台二进制并创建 GitHub Release
 name: Release
 
 on:
@@ -33,15 +33,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact: local-gateway-linux-amd64
+          # Windows x64（Intel/AMD 芯片）
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: local-gateway-windows-amd64.exe
+            platform: windows-x64
+            ext: .exe
+          # Windows ARM64
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            platform: windows-arm64
+            ext: .exe
+          # macOS Apple Silicon（M 系列芯片）
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: local-gateway-macos-arm64
+            platform: macos-arm64
+            ext: ""
+          # macOS Intel 芯片
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos-x64
+            ext: ""
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -53,11 +64,22 @@ jobs:
       - name: 构建
         run: cargo build --release --target ${{ matrix.target }}
         shell: bash
+      # 从 Cargo.toml 读取版本号，供产物命名使用
+      - name: 读取版本号
+        shell: bash
+        run: echo "VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/version = \"//;s/\"//')" >> "$GITHUB_ENV"
+      # 产物命名为 local-gateway-v<版本>-<平台>[.exe]
+      - name: 重命名产物
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/local-gateway${{ matrix.ext }}" \
+             "dist/local-gateway-v${{ env.VERSION }}-${{ matrix.platform }}${{ matrix.ext }}"
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: target/${{ matrix.target }}/release/local-gateway*
+          name: ${{ matrix.platform }}
+          path: dist/*
 
   release:
     needs: build
