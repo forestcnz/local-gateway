@@ -3,7 +3,7 @@ name: Release
 
 on:
   push:
-    branches: [master]
+    branches: [release]
 
 # 创建 Release 需要 GITHUB_TOKEN 的写权限
 permissions:
