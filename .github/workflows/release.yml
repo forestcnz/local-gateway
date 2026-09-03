@@ -1,0 +1,82 @@
+# 推送 master 时自动构建三平台二进制并创建 GitHub Release
+name: Release
+
+on:
+  push:
+    branches: [master]
+
+# 创建 Release 需要 GITHUB_TOKEN 的写权限
+permissions:
+  contents: write
+
+# 同一分支新推送会取消进行中的旧构建，避免重复发布
+concurrency:
+  group: release-master
+  cancel-in-progress: true
+
+jobs:
+  # 先跑测试，测试不过不发布
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 测试
+        run: cargo test
+
+  build:
+    needs: test
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: local-gateway-linux-amd64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: local-gateway-windows-amd64.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: local-gateway-macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: 构建
+        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/${{ matrix.target }}/release/local-gateway*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      # tag 形如 v0.1.0-<短SHA>，每次推送唯一，版本号取自 Cargo.toml
+      - name: 计算 tag
+        id: tag
+        run: echo "tag=v$(grep -m1 '^version' Cargo.toml | sed 's/version = \"//;s/\"//')-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: local-gateway ${{ steps.tag.outputs.tag }}
+          files: dist/*
+          generate_release_notes: true
