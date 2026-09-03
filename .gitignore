@@ -1,0 +1,8 @@
+/target
+/logs
+/.smoke
+/screenshots
+config.toml
+*.db
+*.db-shm
+*.db-wal
