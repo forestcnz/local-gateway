@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -112,6 +113,25 @@ pub async fn forward(
     // 上游应收到真实模型名：改写请求体 model 字段（一次），其余内容原样
     if real_model != model {
         body_json["model"] = serde_json::json!(real_model);
+    }
+    // OpenAI chat 协议流式默认不返回 usage，主动要求上游附带，
+    // 否则日志 token 统计全 0；客户端已带 stream_options 时不覆盖。
+    if matches!(protocol, Protocol::Chat)
+        && body_json
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    {
+        if let Some(obj) = body_json.as_object_mut() {
+            let so = obj
+                .entry("stream_options")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(so_obj) = so.as_object_mut() {
+                so_obj
+                    .entry("include_usage")
+                    .or_insert(serde_json::json!(true));
+            }
+        }
     }
     let payload: Bytes = match serde_json::to_vec(&body_json) {
         Ok(v) => Bytes::from(v),
@@ -234,6 +254,45 @@ enum UpstreamFail {
     Transport(String),
 }
 
+/// 流式日志守卫：客户端中途断开导致 body 被 drop、finisher 未执行时，
+/// 在 Drop 中补写日志，避免整条请求记录（含已扫到的 token）丢失。
+struct StreamLogGuard {
+    st: Arc<AppState>,
+    usage: Arc<std::sync::Mutex<Usage>>,
+    protocol: &'static str,
+    path: String,
+    model: String,
+    provider: String,
+    status: u16,
+    attempts: Vec<String>,
+    started: Instant,
+    done: Arc<AtomicBool>,
+}
+
+impl Drop for StreamLogGuard {
+    fn drop(&mut self) {
+        if self.done.load(Ordering::Relaxed) {
+            return;
+        }
+        let u = *self.usage.lock().unwrap();
+        self.st.db.insert_log(&db::ReqLog {
+            ts: chrono::Local::now(),
+            protocol: self.protocol.into(),
+            path: self.path.clone(),
+            model: self.model.clone(),
+            provider: self.provider.clone(),
+            status: self.status,
+            latency_ms: self.started.elapsed().as_millis() as u64,
+            stream: true,
+            attempts: self.attempts.clone(),
+            error: Some("客户端中断流".into()),
+            tokens_in: u[0],
+            tokens_out: u[1],
+            tokens_cached: u[2],
+        });
+    }
+}
+
 /// 成功拿到上游响应头后的收尾：非流式缓冲解析 usage，流式边透传边扫描。
 #[allow(clippy::too_many_arguments)]
 async fn finish_response(
@@ -271,15 +330,14 @@ async fn finish_response(
         // 流式：逐块透传，同时扫描 SSE 文本中的 usage；流结束时写日志
         let usage: Arc<std::sync::Mutex<Usage>> = Arc::new(std::sync::Mutex::new([0; 3]));
         let usage_scan = usage.clone();
-        let buf: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
+        let buf: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let buf_scan = buf.clone();
         let scanned = up.bytes_stream().map(move |r| {
             if let Ok(bytes) = &r {
                 if let Ok(mut b) = buf_scan.lock() {
                     if let Ok(mut u) = usage_scan.lock() {
-                        if let Ok(txt) = std::str::from_utf8(bytes) {
-                            scan_usage(&mut b, txt, &mut u);
-                        }
+                        // 直接扫字节：多字节字符跨 chunk 被切断也不会丢整个 chunk
+                        scan_usage(&mut b, bytes, &mut u);
                     }
                 }
             }
@@ -293,7 +351,19 @@ async fn finish_response(
         let path = path.to_string();
         let attempts = attempts.to_vec();
         let protocol_str = protocol.as_str().to_string();
-        // 流结束时补写日志（带完整 token 用量）
+        // 流结束时补写日志（带完整 token 用量）；客户端断开时由守卫兑底补写
+        let guard = StreamLogGuard {
+            st: st2.clone(),
+            usage: usage_done.clone(),
+            protocol: protocol.as_str(),
+            path: path.clone(),
+            model: model.clone(),
+            provider: provider_name.clone(),
+            status,
+            attempts: attempts.clone(),
+            started,
+            done: Arc::new(AtomicBool::new(false)),
+        };
         let finisher = futures::stream::once(async move {
             let u = *usage_done.lock().unwrap();
             st2.db.insert_log(&db::ReqLog {
@@ -311,6 +381,7 @@ async fn finish_response(
                 tokens_out: u[1],
                 tokens_cached: u[2],
             });
+            guard.done.store(true, Ordering::Relaxed); // 正常走完，无需守卫兑底
             Ok(axum::body::Bytes::new())
         });
         let body = Body::from_stream(futures::StreamExt::chain(scanned, finisher));
@@ -366,7 +437,24 @@ fn is_stream_accept(accept: Option<&HeaderValue>) -> bool {
 
 type Usage = [u64; 3]; // [输入, 输出, 缓存]
 
+/// 合法 usage 对象至少包含这些键之一；防止流式文本中的其它 "usage": {...}
+/// （如模型输出内容、上游扩展字段）被误当真实用量合并。
+const USAGE_KEYS: &[&str] = &[
+    "prompt_tokens",
+    "input_tokens",
+    "completion_tokens",
+    "output_tokens",
+    "cached_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "prompt_tokens_details",
+    "completion_tokens_details",
+];
+
 fn merge_usage(usage: &mut Usage, v: &serde_json::Value) {
+    if !USAGE_KEYS.iter().any(|k| v.get(*k).is_some()) {
+        return; // 不是真实的 usage 对象，忽略
+    }
     let num = |o: &serde_json::Value, keys: &[&str]| -> u64 {
         keys.iter()
             .filter_map(|k| o.get(*k))
@@ -374,16 +462,31 @@ fn merge_usage(usage: &mut Usage, v: &serde_json::Value) {
             .max()
             .unwrap_or(0)
     };
-    usage[0] = usage[0].max(num(v, &["prompt_tokens", "input_tokens"]));
-    // 输出口径：OpenAI 的 completion_tokens 已含推理 token；但部分上游（LiteLLM
-    // 转发推理模型时）会把 completion_tokens 记 0、实际生成量放在
-    // completion_tokens_details.reasoning_tokens —— 此处取两者较大值兜底。
+    // 输入口径：OpenAI 的 prompt_tokens 已含缓存命中；Anthropic 的 input_tokens
+    // 不含缓存部分（cache_read / cache_creation 单列）。为使两种协议的 tokens_in
+    // 都等于全部输入消耗，Anthropic 口径将缓存部分并入输入。
+    let input = if v.get("input_tokens").is_some() {
+        num(v, &["input_tokens"])
+            + num(v, &["cache_read_input_tokens"])
+            + num(v, &["cache_creation_input_tokens"])
+    } else {
+        num(v, &["prompt_tokens"])
+    };
+    usage[0] = usage[0].max(input);
+    // 输出口径：OpenAI 的 completion_tokens 已含推理 token（reasoning 是其子集，
+    // completion ≥ reasoning 恒成立）。若 completion < reasoning，说明上游（LiteLLM
+    // 类网关）把推理单列、completion 只数可见内容，此时两者相加才是总输出。
     let completion = num(v, &["completion_tokens", "output_tokens"]);
     let reasoning = v
         .get("completion_tokens_details")
         .map(|d| num(d, &["reasoning_tokens"]))
         .unwrap_or(0);
-    usage[1] = usage[1].max(completion.max(reasoning));
+    let output = if completion >= reasoning {
+        completion
+    } else {
+        completion + reasoning
+    };
+    usage[1] = usage[1].max(output);
     // 缓存口径：OpenAI 的 cached_tokens（含于输入）/ Anthropic 的
     // cache_read + cache_creation。上游未上报时为 0。
     let mut cached = num(v, &["cached_tokens", "cache_read_input_tokens"]);
@@ -405,31 +508,44 @@ fn usage_from_json(bytes: &Bytes) -> Usage {
     usage
 }
 
-/// 在累积文本中查找 "usage" 对象（跨 chunk 安全），合并用量并裁剪已消费部分。
-fn scan_usage(buf: &mut String, chunk: &str, usage: &mut Usage) {
-    buf.push_str(chunk);
+/// 在累积字节流中查找 "usage" 对象（跨 chunk 安全，含 UTF-8 多字节字符跨 chunk），
+/// 合并用量并裁剪已消费部分。
+fn scan_usage(buf: &mut Vec<u8>, chunk: &[u8], usage: &mut Usage) {
+    buf.extend_from_slice(chunk);
+    // 只处理完整 UTF-8 前缀；被切断的多字节字符尾部留待下一个 chunk，不丢数据
+    let valid_up_to = match std::str::from_utf8(buf) {
+        Ok(_) => buf.len(),
+        Err(e) => e.valid_up_to(),
+    };
+    let s = std::str::from_utf8(&buf[..valid_up_to]).unwrap_or("");
     let mut search_from = 0usize;
     loop {
-        let Some(rel) = buf[search_from..].find("\"usage\"") else {
-            // 没有更多 usage：仅保留尾部，防止长流内存膨胀（"usage" 最长 7 字节，留 16 兜底）
-            let keep_from = buf.len().saturating_sub(16);
-            let cut = (0..=keep_from)
-                .rev()
-                .find(|&i| buf.is_char_boundary(i))
-                .unwrap_or(0);
-            buf.drain(..cut);
-            return;
-        };
-        let hit = search_from + rel;
-        let Some(brace_rel) = buf[hit..].find('{') else { return }; // 对象未到齐，等下一个 chunk
-        let start = hit + brace_rel;
-        let Some(end_rel) = json_object_end(&buf[start..]) else { return }; // 同上
-        let end = start + end_rel;
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&buf[start..=end]) {
-            merge_usage(usage, &v);
+        match s[search_from..].find("\"usage\"") {
+            None => {
+                // 没有更多 usage：仅保留尾部，防止长流内存膨胀（"usage" 最长 7 字节，留 16 兑底）
+                let keep_from = s.len().saturating_sub(16);
+                let cut = (0..=keep_from)
+                    .rev()
+                    .find(|&i| s.is_char_boundary(i))
+                    .unwrap_or(0);
+                buf.drain(..cut);
+                return;
+            }
+            Some(rel) => {
+                let hit = search_from + rel;
+                let Some(brace_rel) = s[hit..].find("{") else { break }; // 对象未到齐，等下一个 chunk
+                let start = hit + brace_rel;
+                let Some(end_rel) = json_object_end(&s[start..]) else { break }; // 同上
+                let end = start + end_rel;
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s[start..=end]) {
+                    merge_usage(usage, &v);
+                }
+                search_from = end + 1;
+            }
         }
-        search_from = end + 1;
     }
+    // 对象未到齐：仅裁剪已消费部分，保留未完成区域等待后续 chunk
+    buf.drain(..search_from);
 }
 
 /// 返回字符串中第一个平衡的 `{...}` 对象的结束下标（含），未闭合返回 None。
@@ -570,8 +686,19 @@ mod tests {
     fn usage_from_anthropic_json() {
         let body = br#"{"usage":{"input_tokens":2095,"output_tokens":503,"cache_creation_input_tokens":2085,"cache_read_input_tokens":100}}"#;
         let u = usage_from_json(&Bytes::from_static(body));
+        // tokens_in = input_tokens + cache_read + cache_creation（与 OpenAI 口径对齐）
         // 缓存 = cache_read + cache_creation
-        assert_eq!(u, [2095, 503, 2185]);
+        assert_eq!(u, [4280, 503, 2185]);
+    }
+
+    #[test]
+    fn usage_ignores_object_without_known_keys() {
+        // 模型输出文本中恰好有 "usage": {...} 但不含已知键，不应计入
+        let mut usage = [0u64; 3];
+        merge_usage(&mut usage, &serde_json::json!({"count": 999, "total": 1}));
+        assert_eq!(usage, [0, 0, 0]);
+        merge_usage(&mut usage, &serde_json::json!({"prompt_tokens": 5}));
+        assert_eq!(usage, [5, 0, 0]);
     }
 
     #[test]
@@ -583,6 +710,23 @@ mod tests {
     }
 
     #[test]
+    fn usage_reasoning_reported_disjoint_from_completion() {
+        // 上游把推理单列（completion 只数可见内容）：completion < reasoning，
+        // 违反子集语义（completion ≥ reasoning），总输出应为两者之和
+        let body = br#"{"usage":{"prompt_tokens":18,"completion_tokens":9,"total_tokens":27,"completion_tokens_details":{"reasoning_tokens":80}}}"#;
+        let u = usage_from_json(&Bytes::from_static(body));
+        assert_eq!(u, [18, 89, 0]);
+    }
+
+    #[test]
+    fn usage_reasoning_included_in_completion() {
+        // 标准 OpenAI 口径：completion 已含推理，直接取 completion 不重复相加
+        let body = br#"{"usage":{"prompt_tokens":20,"completion_tokens":50,"completion_tokens_details":{"reasoning_tokens":49}}}"#;
+        let u = usage_from_json(&Bytes::from_static(body));
+        assert_eq!(u, [20, 50, 0]);
+    }
+
+    #[test]
     fn usage_without_usage_key() {
         let u = usage_from_json(&Bytes::from_static(br#"{"ok":true}"#));
         assert_eq!(u, [0, 0, 0]);
@@ -590,37 +734,51 @@ mod tests {
 
     #[test]
     fn scan_usage_across_chunk_boundary() {
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         let mut usage = [0u64; 3];
-        scan_usage(&mut buf, "data: {\"usage\": {\"prompt_tok", &mut usage);
+        scan_usage(&mut buf, b"data: {\"usage\": {\"prompt_tok", &mut usage);
         assert_eq!(usage, [0, 0, 0]); // 对象未到齐
-        scan_usage(&mut buf, "ens\": 7, \"completion_tokens\": 3}}\n\n", &mut usage);
+        scan_usage(&mut buf, b"ens\": 7, \"completion_tokens\": 3}}\n\n", &mut usage);
+        assert_eq!(usage, [7, 3, 0]);
+    }
+
+    #[test]
+    fn scan_usage_survives_multibyte_split_across_chunks() {
+        // 中文多字节字符在 chunk 边界被切断，usage 不应丢失
+        let mut buf = Vec::new();
+        let mut usage = [0u64; 3];
+        let t = "你好".as_bytes(); // "你" 共 3 字节，从中间切开
+        scan_usage(&mut buf, b"data: {\"delta\":{\"text\":\"", &mut usage);
+        scan_usage(&mut buf, &t[..2], &mut usage);
+        scan_usage(&mut buf, &t[2..], &mut usage);
+        scan_usage(&mut buf, b"\"},\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n", &mut usage);
         assert_eq!(usage, [7, 3, 0]);
     }
 
     #[test]
     fn scan_usage_anthropic_message_start_and_delta() {
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         let mut usage = [0u64; 3];
         scan_usage(
             &mut buf,
-            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2095,\"cache_read_input_tokens\":100}}}\n\n",
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2095,\"cache_read_input_tokens\":100}}}\n\n",
             &mut usage,
         );
         scan_usage(
             &mut buf,
-            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":503}}\n\n",
+            b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":503}}\n\n",
             &mut usage,
         );
-        assert_eq!(usage, [2095, 503, 100]);
+        // tokens_in = input_tokens + cache_read_input_tokens
+        assert_eq!(usage, [2195, 503, 100]);
     }
 
     #[test]
     fn scan_usage_ignores_usage_word_in_content() {
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         let mut usage = [0u64; 3];
         // 内容里出现 "usage" 字样但没有 JSON 对象，不应 panic 也不应误配
-        scan_usage(&mut buf, "data: {\"delta\":{\"text\":\"my usage report\"}}\n\n", &mut usage);
+        scan_usage(&mut buf, b"data: {\"delta\":{\"text\":\"my usage report\"}}\n\n", &mut usage);
         assert_eq!(usage, [0, 0, 0]);
     }
 }
