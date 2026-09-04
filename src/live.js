@@ -39,8 +39,6 @@
     return ymd + " " + d.toTimeString().slice(0, 8);
   };
 
-  let logsCache = [];
-
   /* ---------- 统计 & 元信息 ---------- */
   let lastHourlyKey = "";
 
@@ -240,6 +238,15 @@
     return [l.tokens_in, l.tokens_out, l.tokens_cached].map(fmtK).join(" / ");
   }
 
+  function uaCell(l) {
+    const ua = l.user_agent || "";
+    if (!ua) return '<td><span class="dim">—</span></td>';
+    return (
+      '<td title="' + esc(ua) + '">' +
+      '<div class="mono dim" style="font-size:11.5px;max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(ua) + "</div></td>"
+    );
+  }
+
   function logRow(l, i) {
     const s = String(l.status);
     const cls = s[0] === "2" ? "s2" : s[0] === "4" ? "s4" : "s5";
@@ -254,7 +261,8 @@
       '<td><span class="status ' + cls + '">' + s + "</span></td>" +
       '<td><span class="lat-cell"><span class="lat-bar"><i style="width:' + pct + "%;background:" + col + '"></i></span>' + fmtMs(l.latency_ms) + "</span></td>" +
       '<td class="mono" style="text-align:right">' + tokensCell(l) + "</td>" +
-      '<td><span class="detail-link" data-act="detail" data-i="' + i + '">详情</span></td></tr>'
+      uaCell(l) +
+      "</tr>"
     );
   }
 
@@ -275,7 +283,6 @@
   async function refreshLogs() {
     let logs = [];
     try { logs = (await api("/admin/api/logs" + logQuerystring())).logs; } catch { return; }
-    logsCache = logs;
     const tbody = $("#view-logs table.data tbody");
     if (tbody)
       tbody.innerHTML = logs.length
@@ -441,7 +448,6 @@
     if (!el) return;
     const act = el.dataset.act;
     const name = el.dataset.name;
-    const idx = Number(el.dataset.idx);
 
     if (act === "ptoggle") {
       const on = !el.classList.contains("on");
@@ -477,11 +483,6 @@
         showToast("别名已删除");
         renderAliases();
       } catch (err) { showToast("删除失败：" + err.message); }
-    } else if (act === "detail") {
-      const l = logsCache[idx];
-      if (l) {
-        showToast((l.attempts || []).join(" → ") + (l.error ? " · " + l.error : ""));
-      }
     }
   });
 

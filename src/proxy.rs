@@ -39,6 +39,15 @@ pub async fn forward(
     let cfg = st.config();
     let path = protocol.path().to_string();
 
+    let (parts, body) = req.into_parts();
+    // 客户端 UA：HeaderValue 用于转发上游；日志里存纯文本（未提供时空串）
+    let inbound_ua = parts.headers.get("user-agent").cloned();
+    let ua_log = inbound_ua
+        .as_ref()
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
     // 网关自身拒绝的请求同样记入日志，保证统计与曲线反映全部流量
     macro_rules! reject {
         ($status:expr, $model:expr, $msg:expr) => {{
@@ -58,12 +67,12 @@ pub async fn forward(
                 tokens_in: 0,
                 tokens_out: 0,
                 tokens_cached: 0,
+                user_agent: ua_log.clone(),
             });
             return gateway_error_json(status, &msg);
         }};
     }
 
-    let (parts, body) = req.into_parts();
     let limit = (cfg.max_body_mb.saturating_mul(1024 * 1024)) as usize;
     let payload = match axum::body::to_bytes(body, limit).await {
         Ok(b) => b,
@@ -158,7 +167,6 @@ pub async fn forward(
         .cloned()
         .unwrap_or(HeaderValue::from_static("application/json"));
     let inbound_accept = parts.headers.get("accept").cloned();
-    let inbound_ua = parts.headers.get("user-agent").cloned();
     let anthropic_version = parts
         .headers
         .get("anthropic-version")
@@ -185,7 +193,7 @@ pub async fn forward(
                 attempts.push(format!("{}:{}", provider.name, status));
                 return finish_response(
                     &st, up, status, &attempts, &provider.name, protocol, &path, &real_model,
-                    &cache_key, started, inbound_accept.as_ref(),
+                    &cache_key, started, inbound_accept.as_ref(), ua_log.clone(),
                 )
                 .await;
             }
@@ -210,6 +218,7 @@ pub async fn forward(
                     tokens_in: 0,
                     tokens_out: 0,
                     tokens_cached: 0,
+                    user_agent: ua_log.clone(),
                 });
                 return error_response(status, body, content_type);
             }
@@ -238,6 +247,7 @@ pub async fn forward(
         tokens_in: 0,
         tokens_out: 0,
         tokens_cached: 0,
+        user_agent: ua_log.clone(),
     });
     gateway_error_json(
         StatusCode::BAD_GATEWAY,
@@ -266,6 +276,7 @@ struct StreamLogGuard {
     status: u16,
     attempts: Vec<String>,
     started: Instant,
+    user_agent: String,
     done: Arc<AtomicBool>,
 }
 
@@ -289,6 +300,7 @@ impl Drop for StreamLogGuard {
             tokens_in: u[0],
             tokens_out: u[1],
             tokens_cached: u[2],
+            user_agent: self.user_agent.clone(),
         });
     }
 }
@@ -307,6 +319,7 @@ async fn finish_response(
     cache_key: &str,
     started: Instant,
     _accept: Option<&HeaderValue>,
+    ua: String,
 ) -> Response {
     let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
     let ct = up.headers().get("content-type").cloned();
@@ -362,6 +375,7 @@ async fn finish_response(
             status,
             attempts: attempts.clone(),
             started,
+            user_agent: ua.clone(),
             done: Arc::new(AtomicBool::new(false)),
         };
         let finisher = futures::stream::once(async move {
@@ -380,6 +394,7 @@ async fn finish_response(
                 tokens_in: u[0],
                 tokens_out: u[1],
                 tokens_cached: u[2],
+                user_agent: ua,
             });
             guard.done.store(true, Ordering::Relaxed); // 正常走完，无需守卫兑底
             Ok(axum::body::Bytes::new())
@@ -404,6 +419,7 @@ async fn finish_response(
             tokens_in: usage[0],
             tokens_out: usage[1],
             tokens_cached: usage[2],
+            user_agent: ua,
         });
         let mut hm = HeaderMap::new();
         hm.extend(headers.drain());

@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS requests (
     latency_ms INTEGER NOT NULL DEFAULT 0,
     stream     INTEGER NOT NULL DEFAULT 0,
     attempts   TEXT    NOT NULL DEFAULT '[]',
-    error      TEXT
+    error      TEXT,
+    user_agent TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts_epoch);
 CREATE TABLE IF NOT EXISTS providers (
@@ -46,10 +47,15 @@ CREATE TABLE IF NOT EXISTS aliases (
 );
 ";
 
-/// 旧库升级：为 requests 表补充 token 列（已存在则忽略）。
-fn migrate_token_columns(conn: &Connection) {
-    for col in ["tokens_in", "tokens_out", "tokens_cached"] {
-        let sql = format!("ALTER TABLE requests ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0");
+/// 旧库升级：为 requests 表补充后加列（已存在则忽略）。
+fn migrate_columns(conn: &Connection) {
+    for (col, decl) in [
+        ("tokens_in", "INTEGER NOT NULL DEFAULT 0"),
+        ("tokens_out", "INTEGER NOT NULL DEFAULT 0"),
+        ("tokens_cached", "INTEGER NOT NULL DEFAULT 0"),
+        ("user_agent", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        let sql = format!("ALTER TABLE requests ADD COLUMN {col} {decl}");
         if let Err(e) = conn.execute(&sql, []) {
             let msg = e.to_string();
             if !msg.contains("duplicate column name") {
@@ -86,6 +92,9 @@ pub struct ReqLog {
     pub tokens_out: u64,
     #[serde(default)]
     pub tokens_cached: u64,
+    /// 客户端 User-Agent；请求未携带时为空串
+    #[serde(default)]
+    pub user_agent: String,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +179,7 @@ fn row_to_log(row: &rusqlite::Row) -> rusqlite::Result<ReqLog> {
         tokens_in: row.get::<_, i64>(11).unwrap_or(0) as u64,
         tokens_out: row.get::<_, i64>(12).unwrap_or(0) as u64,
         tokens_cached: row.get::<_, i64>(13).unwrap_or(0) as u64,
+        user_agent: row.get::<_, String>(14).unwrap_or_default(),
     })
 }
 
@@ -187,7 +197,7 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
-        migrate_token_columns(&conn);
+        migrate_columns(&conn);
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -201,8 +211,8 @@ impl Db {
         let res = conn.execute(
             "INSERT INTO requests
                 (ts, ts_epoch, protocol, path, model, provider, status, latency_ms, stream, attempts, error,
-                 tokens_in, tokens_out, tokens_cached)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 tokens_in, tokens_out, tokens_cached, user_agent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             rusqlite::params![
                 e.ts.to_rfc3339(),
                 e.ts.timestamp(),
@@ -218,6 +228,7 @@ impl Db {
                 e.tokens_in as i64,
                 e.tokens_out as i64,
                 e.tokens_cached as i64,
+                e.user_agent,
             ],
         );
         if let Err(err) = res {
@@ -230,7 +241,7 @@ impl Db {
         let Ok(conn) = self.conn.lock() else { return vec![] };
         let mut sql = String::from(
             "SELECT ts, ts_epoch, protocol, path, model, provider, status, latency_ms, stream, attempts, error, \
-                    tokens_in, tokens_out, tokens_cached \
+                    tokens_in, tokens_out, tokens_cached, user_agent \
              FROM requests WHERE 1=1",
         );
         let mut vals: Vec<rusqlite::types::Value> = Vec::new();
@@ -464,6 +475,7 @@ mod tests {
             tokens_in: 10,
             tokens_out: 5,
             tokens_cached: 2,
+            user_agent: "ua-test/1.2".into(),
         }
     }
 
@@ -495,9 +507,10 @@ mod tests {
             0
         );
 
-        // token 列随行返回
+        // token / user_agent 列随行返回
         let all = store.query_logs(&LogFilter { limit: 10, ..Default::default() });
         assert!(all.iter().all(|l| (l.tokens_in, l.tokens_out, l.tokens_cached) == (10, 5, 2)));
+        assert!(all.iter().all(|l| l.user_agent == "ua-test/1.2"));
 
         // 滚动 24 小时：旧行不在窗口内；now-1h 与 now 同在最后一桶
         let hourly = store.hourly_counts(Local::now());
