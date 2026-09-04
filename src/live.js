@@ -258,6 +258,20 @@
     );
   }
 
+  // 总览页「最近请求」行渲染（6 列精简版，不含详情入口）
+  function recentRow(l) {
+    const s = String(l.status);
+    const cls = s[0] === "2" ? "s2" : s[0] === "4" ? "s4" : "s5";
+    return (
+      '<tr><td class="time">' + hhmmss(l.ts) + "</td>" +
+      '<td class="mono dim">POST ' + esc(l.path) + "</td>" +
+      '<td class="model">' + esc(l.model) + "</td>" +
+      '<td class="dim">' + esc(l.provider || "—") + "</td>" +
+      '<td><span class="status ' + cls + '">' + s + "</span></td>" +
+      '<td class="mono" style="text-align:right">' + fmtMs(l.latency_ms) + "</td></tr>"
+    );
+  }
+
   async function refreshLogs() {
     let logs = [];
     try { logs = (await api("/admin/api/logs" + logQuerystring())).logs; } catch { return; }
@@ -267,19 +281,17 @@
       tbody.innerHTML = logs.length
         ? logs.map(logRow).join("")
         : '<tr><td colspan="8" class="dim" style="text-align:center;padding:28px">暂无请求，向网关发出第一次调用后这里会出现记录</td></tr>';
+    // 总览「最近请求」独立拉取全时段最近 5 条，
+    // 不跟随日志页筛选（默认「时间：今天」会导致当天无请求时显示为空）
+    let recentLogs = [];
+    try { recentLogs = (await api("/admin/api/logs?limit=5")).logs; } catch { recentLogs = []; }
     const recent = $("#view-overview table.mini-table tbody");
-    if (recent) recent.innerHTML = logs.slice(0, 5).map(function (l) {
-      const s = String(l.status);
-      const cls = s[0] === "2" ? "s2" : s[0] === "4" ? "s4" : "s5";
-      return (
-        '<tr><td class="time">' + hhmmss(l.ts) + "</td>" +
-        '<td class="mono dim">POST ' + esc(l.path) + "</td>" +
-        '<td class="model">' + esc(l.model) + "</td>" +
-        '<td class="dim">' + esc(l.provider || "—") + "</td>" +
-        '<td><span class="status ' + cls + '">' + s + "</span></td>" +
-        '<td class="mono" style="text-align:right">' + fmtMs(l.latency_ms) + "</td></tr>"
-      );
-    }).join("") || recent.innerHTML;
+    if (recent) {
+      // 无真实日志时显示空状态，绝不能回退保留 HTML 里的演示数据
+      recent.innerHTML = recentLogs.length
+        ? recentLogs.map(recentRow).join("")
+        : '<tr><td colspan="6" class="dim" style="text-align:center;padding:18px">暂无请求，向网关发出第一次调用后这里会出现记录</td></tr>';
+    }
   }
 
   /* ---------- 弹窗：新增 / 编辑供应商 ---------- */
