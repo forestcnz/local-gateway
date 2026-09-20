@@ -53,6 +53,12 @@ jobs:
             target: x86_64-apple-darwin
             platform: macos-x64
             ext: ""
+          # Linux x64（Debian/Ubuntu），额外打包 .deb 安装包
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x64
+            ext: ""
+            deb: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -75,6 +81,28 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/local-gateway${{ matrix.ext }}" \
              "dist/local-gateway-v${{ env.VERSION }}-${{ matrix.platform }}${{ matrix.ext }}"
+      # 仅 Linux x64 目标额外打包 Debian(.deb) 安装包
+      - name: 打包 Debian 安装包
+        if: matrix.deb
+        shell: bash
+        run: |
+          set -e
+          # 在临时目录内组装 .deb 包目录结构
+          PKG_ROOT="$RUNNER_TEMP/local-gateway-pkg"
+          mkdir -p "$PKG_ROOT/usr/bin" "$PKG_ROOT/DEBIAN"
+          cp "target/${{ matrix.target }}/release/local-gateway" "$PKG_ROOT/usr/bin/local-gateway"
+          # 生成 Debian control 文件，版本号取自 Cargo.toml
+          cat > "$PKG_ROOT/DEBIAN/control" <<EOF
+          Package: local-gateway
+          Version: $VERSION
+          Section: net
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Local Gateway Developers
+          Description: AI Model API Gateway (OpenAI / Anthropic / Responses)
+          EOF
+          # 用 dpkg-deb 产出 .deb，放入 dist 随 Release 一起发布
+          dpkg-deb --build "$PKG_ROOT" "dist/local-gateway_${VERSION}_amd64.deb"
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
