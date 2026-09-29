@@ -507,6 +507,94 @@ mod e2e {
         assert!(persisted.contains(&("glm-5.4".into(), "gpt-4o".into())));
         assert!(!persisted.iter().any(|(k, _)| k == "glm-5.3"));
 
+        // ── 7c. 管理 API：日志分页（page/page_size/total/pages；limit 兼容） ──
+        // 补充 25 条合成日志，便于构造多页数据（此前共 7 条，现 32 条）
+        for i in 0..25u32 {
+            st.db.insert_log(&db::ReqLog {
+                ts: chrono::Local::now() - chrono::Duration::seconds(i as i64),
+                protocol: "chat".into(),
+                path: "/v1/chat/completions".into(),
+                model: format!("page-model-{i}"),
+                provider: "good".into(),
+                status: 200,
+                latency_ms: 10,
+                stream: false,
+                attempts: vec![],
+                error: None,
+                tokens_in: 1,
+                tokens_out: 1,
+                tokens_cached: 0,
+                user_agent: "pagetest".into(),
+            });
+        }
+        // page_size 有下限钳制：请求 3 → 实际 10
+        let v: Value = cli
+            .get(format!("{gw}/admin/api/logs?page=1&page_size=3"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["page_size"], 10);
+        assert_eq!(v["count"], 10);
+        assert_eq!(v["total"], 32);
+        assert_eq!(v["pages"], 4);
+        assert_eq!(v["page"], 1);
+        // 第 1 页与第 2 页内容不同（offset 生效）
+        let v2: Value = cli
+            .get(format!("{gw}/admin/api/logs?page=2&page_size=10"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v2["count"], 10);
+        assert_ne!(v["logs"][0]["model"], v2["logs"][0]["model"]);
+        // 末页：32 = 10 × 3 + 2
+        let v4: Value = cli
+            .get(format!("{gw}/admin/api/logs?page=4&page_size=10"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v4["count"], 2);
+        // 越界页 → 空列表
+        let v99: Value = cli
+            .get(format!("{gw}/admin/api/logs?page=99&page_size=10"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v99["count"], 0);
+        // 筛选 + 分页组合：page-model 共 25 条 → 3 页
+        let vf: Value = cli
+            .get(format!("{gw}/admin/api/logs?q=page-model&page=2&page_size=10"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(vf["total"], 25);
+        assert_eq!(vf["count"], 10);
+        assert_eq!(vf["pages"], 3);
+        // 旧 limit 参数仍然可用（总览「最近请求」依赖）
+        let v5: Value = cli
+            .get(format!("{gw}/admin/api/logs?limit=5"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v5["count"], 5);
+
         // 供应商写入 DB（不再有 config.toml）
         let names: Vec<String> = st
             .db

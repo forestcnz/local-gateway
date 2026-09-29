@@ -881,6 +881,20 @@ table.data tbody tr:hover{background:var(--ink-06)}
       </table>
     </div>
 
+    <div class="reveal" style="--i:2;display:flex;align-items:center;gap:12px;margin-top:14px;flex-wrap:wrap">
+      <button class="btn sm" id="pgPrev">‹ 上一页</button>
+      <span class="mono dim" id="pgInfo" style="font-size:11.5px">加载中…</span>
+      <button class="btn sm" id="pgNext">下一页 ›</button>
+      <span style="margin-left:auto;display:flex;align-items:center;gap:8px">
+        <span class="dim" style="font-size:11.5px">每页</span>
+        <select class="fsel" id="pgSize" style="width:auto">
+          <option value="50">50 条</option>
+          <option value="100">100 条</option>
+          <option value="200">200 条</option>
+        </select>
+      </span>
+    </div>
+
     <div class="draft-foot reveal" style="--i:3">
       <span class="legend"> 主备切换自动发生，日志中标注切换轨迹</span>
       <span>点击「详情」可展开请求/响应头与报文摘要（脱敏）</span>

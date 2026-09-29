@@ -77,6 +77,10 @@ async fn console() -> axum::response::Html<&'static str> {
 #[derive(Deserialize)]
 struct LogsQuery {
     limit: Option<usize>,
+    /// 页码（1 起）。提供 page 时走分页模式，忽略 limit
+    page: Option<usize>,
+    /// 每页条数（分页模式），默认 50，范围 10..=200
+    page_size: Option<usize>,
     protocol: Option<String>,
     provider: Option<String>,
     /// 状态类别：2 / 4 / 5（2xx / 4xx / 5xx）
@@ -119,8 +123,18 @@ async fn logs_handler(
         Some("today") => Some(db::day_start_epoch(chrono::Local::now().date_naive())),
         _ => None,
     };
+    // 分页模式（带 page）：page_size 默认 50；兼容模式（仅 limit）：offset=0
+    let (page, page_size, limit, offset) = match q.page {
+        Some(p) => {
+            let ps = q.page_size.unwrap_or(50).clamp(10, 200);
+            let page = p.max(1);
+            (page, ps, ps, (page - 1) * ps)
+        }
+        None => (0, 0, q.limit.unwrap_or(100).clamp(1, 1000), 0),
+    };
     let filter = db::LogFilter {
-        limit: q.limit.unwrap_or(100).clamp(1, 1000),
+        limit,
+        offset,
         protocol: q.protocol.filter(|s| !s.is_empty()),
         provider: q.provider.filter(|s| !s.is_empty()),
         status_class: q
@@ -134,7 +148,20 @@ async fn logs_handler(
             .map(|s| s.trim().to_string()),
     };
     let logs = st.db.query_logs(&filter);
-    ok_json(json!({ "logs": logs, "count": logs.len() }))
+    let total = st.db.count_logs(&filter);
+    let pages = if total == 0 || page_size == 0 {
+        1
+    } else {
+        (total + page_size as u64 - 1) / page_size as u64
+    };
+    ok_json(json!({
+        "logs": logs,
+        "count": logs.len(),
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }))
 }
 
 async fn clear_logs(State(st): State<Arc<AppState>>) -> ApiResult {

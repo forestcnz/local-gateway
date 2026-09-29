@@ -257,7 +257,11 @@
     aliasModal.classList.remove("open");
   }
 
-  /* ---------- 请求日志 ---------- */
+  /* ---------- 请求日志（分页） ---------- */
+  let logsPage = 1;
+  let logsPageSize = 50;
+  let logsPages = 1;
+
   function logQuerystring() {
     const p = new URLSearchParams();
     const fP = $("#fProtocol")?.value || "";
@@ -270,7 +274,8 @@
     if (fS) p.set("status", fS);
     if (fT) p.set("since", fT);
     if (fq) p.set("q", fq);
-    p.set("limit", "200");
+    p.set("page", String(logsPage));
+    p.set("page_size", String(logsPageSize));
     const s = p.toString();
     return s ? "?" + s : "";
   }
@@ -323,14 +328,28 @@
     );
   }
 
+  function renderLogPager(total, pages) {
+    logsPages = pages;
+    const info = $("#pgInfo");
+    if (info) info.textContent = "第 " + logsPage + " / " + pages + " 页 · 共 " + Number(total).toLocaleString() + " 条";
+    const prev = $("#pgPrev"), next = $("#pgNext");
+    if (prev) prev.disabled = logsPage <= 1;
+    if (next) next.disabled = logsPage >= pages;
+  }
+
   async function refreshLogs() {
-    let logs = [];
-    try { logs = (await api("/admin/api/logs" + logQuerystring())).logs; } catch { return; }
+    let d;
+    try { d = await api("/admin/api/logs" + logQuerystring()); } catch { return; }
+    const logs = d.logs || [];
+    const pages = Math.max(1, d.pages || 1);
+    // 页码越界（如筛选后条数变少）时回退到最后一页
+    if (logsPage > pages) { logsPage = pages; return refreshLogs(); }
     const tbody = $("#view-logs table.data tbody");
     if (tbody)
       tbody.innerHTML = logs.length
         ? logs.map(logRow).join("")
         : '<tr><td colspan="8" class="dim" style="text-align:center;padding:28px">暂无请求，向网关发出第一次调用后这里会出现记录</td></tr>';
+    renderLogPager(d.total || 0, pages);
     // 总览「最近请求」独立拉取全时段最近 5 条，
     // 不跟随日志页筛选（默认「时间：今天」会导致当天无请求时显示为空）
     let recentLogs = [];
@@ -549,17 +568,18 @@
 
   function initFilters() {
     const selects = ["#fProtocol", "#fProvider", "#fStatus", "#fSince"].map((s) => $(s)).filter(Boolean);
-    selects.forEach((sel) => sel.addEventListener("change", () => refreshLogs()));
+    selects.forEach((sel) => sel.addEventListener("change", () => { logsPage = 1; refreshLogs(); }));
     const search = $("#fSearch");
     if (search) {
       let deb;
       search.addEventListener("input", () => {
         clearTimeout(deb);
-        deb = setTimeout(refreshLogs, 300);
+        deb = setTimeout(() => { logsPage = 1; refreshLogs(); }, 300);
       });
       search.addEventListener("keydown", (e) => {
         if (e.key === "Enter") {
           clearTimeout(deb);
+          logsPage = 1;
           refreshLogs();
         }
       });
@@ -622,6 +642,20 @@
       const aliasSaveBtn = $("#aliasEditSave");
       if (aliasSaveBtn) aliasSaveBtn.addEventListener("click", saveAliasEdit);
     }
+
+    // 日志分页控件
+    const pgPrev = $("#pgPrev"), pgNext = $("#pgNext"), pgSize = $("#pgSize");
+    if (pgPrev) pgPrev.addEventListener("click", () => {
+      if (logsPage > 1) { logsPage--; refreshLogs(); }
+    });
+    if (pgNext) pgNext.addEventListener("click", () => {
+      if (logsPage < logsPages) { logsPage++; refreshLogs(); }
+    });
+    if (pgSize) pgSize.addEventListener("change", () => {
+      logsPageSize = Number(pgSize.value) || 50;
+      logsPage = 1;
+      refreshLogs();
+    });
 
     initFilters();
     await populateProviderFilter();

@@ -108,6 +108,8 @@ pub struct LogFilter {
     /// 对 model / path / provider 的子串模糊匹配
     pub q: Option<String>,
     pub limit: usize,
+    /// 分页偏移，与 limit 搭配使用
+    pub offset: usize,
 }
 
 impl Default for LogFilter {
@@ -119,6 +121,7 @@ impl Default for LogFilter {
             since_epoch: None,
             q: None,
             limit: 100,
+            offset: 0,
         }
     }
 }
@@ -236,15 +239,8 @@ impl Db {
         }
     }
 
-    /// 按条件查询日志（新→旧）。None/空串表示不过滤该维度。
-    pub fn query_logs(&self, f: &LogFilter) -> Vec<ReqLog> {
-        let Ok(conn) = self.conn.lock() else { return vec![] };
-        let mut sql = String::from(
-            "SELECT ts, ts_epoch, protocol, path, model, provider, status, latency_ms, stream, attempts, error, \
-                    tokens_in, tokens_out, tokens_cached, user_agent \
-             FROM requests WHERE 1=1",
-        );
-        let mut vals: Vec<rusqlite::types::Value> = Vec::new();
+    /// 构造日志查询的 WHERE 子句（query_logs 与 count_logs 共用，避免两处漂移）。
+    fn push_log_where(f: &LogFilter, sql: &mut String, vals: &mut Vec<rusqlite::types::Value>) {
         if let Some(p) = f.protocol.as_deref().filter(|s| !s.is_empty()) {
             sql.push_str(" AND protocol = ?");
             vals.push(p.to_string().into());
@@ -272,14 +268,38 @@ impl Db {
                 vals.push(like.clone().into());
             }
         }
-        sql.push_str(" ORDER BY id DESC LIMIT ?");
+    }
+
+    /// 按条件查询日志（新→旧）。None/空串表示不过滤该维度。
+    pub fn query_logs(&self, f: &LogFilter) -> Vec<ReqLog> {
+        let Ok(conn) = self.conn.lock() else { return vec![] };
+        let mut sql = String::from(
+            "SELECT ts, ts_epoch, protocol, path, model, provider, status, latency_ms, stream, attempts, error, \
+                    tokens_in, tokens_out, tokens_cached, user_agent \
+             FROM requests WHERE 1=1",
+        );
+        let mut vals: Vec<rusqlite::types::Value> = Vec::new();
+        Self::push_log_where(f, &mut sql, &mut vals);
+        sql.push_str(" ORDER BY id DESC LIMIT ? OFFSET ?");
         vals.push((f.limit as i64).into());
+        vals.push((f.offset as i64).into());
 
         let Ok(mut stmt) = conn.prepare(&sql) else { return vec![] };
         match stmt.query_map(rusqlite::params_from_iter(vals.iter()), row_to_log) {
             Ok(it) => it.filter_map(Result::ok).collect(),
             Err(_) => vec![],
         }
+    }
+
+    /// 符合过滤条件的日志总数（忽略 limit/offset，供分页计算总页数）。
+    pub fn count_logs(&self, f: &LogFilter) -> u64 {
+        let Ok(conn) = self.conn.lock() else { return 0 };
+        let mut sql = String::from("SELECT COUNT(*) FROM requests WHERE 1=1");
+        let mut vals: Vec<rusqlite::types::Value> = Vec::new();
+        Self::push_log_where(f, &mut sql, &mut vals);
+        let Ok(mut stmt) = conn.prepare(&sql) else { return 0 };
+        stmt.query_row(rusqlite::params_from_iter(vals.iter()), |r| r.get::<_, i64>(0))
+            .unwrap_or(0) as u64
     }
 
     pub fn total_logs(&self) -> u64 {
