@@ -92,6 +92,11 @@
   function renderStats(d) {
     const chip = $(".top-status .ep-chip .v");
     if (chip) chip.textContent = d.listen;
+    // 版本号随 API 回填，页面不再硬编码（避免发版漏改）
+    const vs = $("#verStamp");
+    if (vs) vs.textContent = "v" + (d.version || "") + " · LIVE";
+    const vf = $("#verFoot");
+    if (vf) vf.textContent = "v" + (d.version || "");
     const nums = $$("#view-overview .stat .num");
     if (nums.length >= 4) {
       nums[0].innerHTML = Number(d.requests).toLocaleString();
