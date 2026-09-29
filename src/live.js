@@ -181,7 +181,9 @@
     return (
       '<tr><td class="mono" style="font-weight:600">' + esc(a) + "</td>" +
       '<td class="mono">' + esc(m) + "</td>" +
-      '<td style="text-align:right"><span class="detail-link" data-act="alias-del" data-alias="' + esc(a) + '">删除</span></td></tr>'
+      '<td style="text-align:right;white-space:nowrap">' +
+      '<span class="detail-link" data-act="alias-edit" data-alias="' + esc(a) + '" data-model="' + esc(m) + '">编辑</span> · ' +
+      '<span class="detail-link" data-act="alias-del" data-alias="' + esc(a) + '">删除</span></td></tr>'
     );
   }
 
@@ -212,6 +214,42 @@
     } catch (e) {
       showToast("保存失败：" + e.message);
     }
+  }
+
+  /* ---------- 弹窗：编辑模型别名 ---------- */
+  const aliasModal = $("#aliasModal");
+  let aliasEditing = null;
+
+  function openAliasModal(a, m) {
+    aliasEditing = a;
+    $("#aliasEditName").value = a;
+    $("#aliasEditModel").value = m;
+    aliasModal.classList.add("open");
+    $("#aliasEditName").focus();
+  }
+
+  async function saveAliasEdit() {
+    const a = ($("#aliasEditName").value || "").trim();
+    const m = ($("#aliasEditModel").value || "").trim();
+    if (!a || !m) { showToast("别名与真实模型名都必填"); return; }
+    if (!aliasEditing) return;
+    try {
+      await api("/admin/api/aliases/" + encodeURIComponent(aliasEditing), {
+        method: "PUT",
+        body: JSON.stringify({ alias: a, model: m }),
+      });
+      showToast(a === aliasEditing
+        ? "别名已保存：" + a + " → " + m
+        : "别名已改名：" + aliasEditing + " → " + a + "（目标 " + m + "）");
+      aliasModal.classList.remove("open");
+      renderAliases();
+    } catch (e) {
+      showToast("保存失败：" + e.message);
+    }
+  }
+
+  function closeAliasModal() {
+    aliasModal.classList.remove("open");
   }
 
   /* ---------- 请求日志 ---------- */
@@ -476,6 +514,8 @@
         showToast("已删除");
         refreshProviders();
       } catch (err) { showToast("删除失败：" + err.message); }
+    } else if (act === "alias-edit") {
+      openAliasModal(el.dataset.alias || "", el.dataset.model || "");
     } else if (act === "alias-del") {
       if (!confirm("确定删除别名「" + el.dataset.alias + "」？")) return;
       try {
@@ -562,6 +602,21 @@
     // 别名添加按钮
     const aliasAddBtn = $("#aliasAdd");
     if (aliasAddBtn) aliasAddBtn.addEventListener("click", addAlias);
+
+    // 别名编辑弹窗：关闭（✕ / 取消 / 点遮罩 / Esc）与保存
+    if (aliasModal) {
+      $$("#aliasModal [data-close-alias-modal]").forEach((b) =>
+        b.addEventListener("click", closeAliasModal)
+      );
+      aliasModal.addEventListener("click", (e) => {
+        if (e.target === aliasModal) closeAliasModal();
+      });
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && aliasModal.classList.contains("open")) closeAliasModal();
+      });
+      const aliasSaveBtn = $("#aliasEditSave");
+      if (aliasSaveBtn) aliasSaveBtn.addEventListener("click", saveAliasEdit);
+    }
 
     initFilters();
     await populateProviderFilter();

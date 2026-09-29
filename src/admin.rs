@@ -208,12 +208,13 @@ async fn list_aliases(State(st): State<Arc<AppState>>) -> Response {
 }
 
 /// upsert：PUT /admin/api/aliases/{alias}，body {"model": "真实模型名"}。
+/// body 可选 {"alias": "新别名"}：编辑别名本身（改名 + 改指向一步完成）。
 async fn upsert_alias(
     State(st): State<Arc<AppState>>,
     Path(alias): Path<String>,
     Json(v): Json<Value>,
 ) -> ApiResult {
-    let alias = alias.trim().to_string();
+    let old_alias = alias.trim().to_string();
     let model = v
         .get("model")
         .and_then(|x| x.as_str())
@@ -221,8 +222,20 @@ async fn upsert_alias(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "缺少 model（真实模型名）"))?
         .to_string();
+    let new_alias = v
+        .get("alias")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| old_alias.clone());
     st.update_config(|cfg| {
-        cfg.aliases.insert(alias.clone(), model.clone());
+        if new_alias != old_alias && cfg.aliases.contains_key(&new_alias) {
+            return Err(format!("别名 {new_alias} 已存在"));
+        }
+        // 改名时移除旧键；旧键不存在也允许，保持 upsert（新建）语义
+        cfg.aliases.remove(&old_alias);
+        cfg.aliases.insert(new_alias.clone(), model.clone());
         Ok(())
     })
     .map_err(|e| err(StatusCode::BAD_REQUEST, e))?;

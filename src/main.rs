@@ -447,6 +447,66 @@ mod e2e {
         assert_eq!(r.status(), 204);
         assert_eq!(r.headers().get("access-control-allow-origin").unwrap(), "*");
 
+        // ── 7b. 管理 API：别名编辑（改指向 / 重命名 / 冲突校验 / 持久化） ──
+        // 只改目标模型（不带 alias 字段，原名 upsert）
+        let r = cli
+            .put(format!("{gw}/admin/api/aliases/glm-5.3"))
+            .json(&json!({"model": "claude-3"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let list: Value = cli
+            .get(format!("{gw}/admin/api/aliases"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let als = list["aliases"].as_array().unwrap();
+        assert!(als.iter().any(|x| x["alias"] == "glm-5.3" && x["model"] == "claude-3"));
+        // 新建一个别名用于改名冲突
+        let r = cli
+            .put(format!("{gw}/admin/api/aliases/zone-b"))
+            .json(&json!({"model": "claude-3"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        // 改名撞上已有别名 → 400
+        let r = cli
+            .put(format!("{gw}/admin/api/aliases/zone-b"))
+            .json(&json!({"alias": "glm-5.3", "model": "claude-3"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 400);
+        // 重命名 + 改指向一步完成：glm-5.3 → glm-5.4
+        let r = cli
+            .put(format!("{gw}/admin/api/aliases/glm-5.3"))
+            .json(&json!({"alias": "glm-5.4", "model": "gpt-4o"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let list: Value = cli
+            .get(format!("{gw}/admin/api/aliases"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let als = list["aliases"].as_array().unwrap();
+        assert!(als.iter().any(|x| x["alias"] == "glm-5.4" && x["model"] == "gpt-4o"));
+        assert!(!als.iter().any(|x| x["alias"] == "glm-5.3"), "旧别名应被移除");
+        assert_eq!(als.len(), 2);
+        // 重命名结果持久化到 DB
+        let persisted = st.db.aliases_load();
+        assert!(persisted.contains(&("glm-5.4".into(), "gpt-4o".into())));
+        assert!(!persisted.iter().any(|(k, _)| k == "glm-5.3"));
+
         // 供应商写入 DB（不再有 config.toml）
         let names: Vec<String> = st
             .db

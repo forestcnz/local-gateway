@@ -734,7 +734,7 @@ table.data tbody tr:hover{background:var(--ink-06)}
     <div class="card reveal" style="--i:2">
       <table class="data">
         <thead>
-          <tr><th>别名（客户端使用）</th><th>真实模型（转发上游）</th><th style="width:90px;text-align:right">操作</th></tr>
+          <tr><th>别名（客户端使用）</th><th>真实模型（转发上游）</th><th style="width:110px;text-align:right">操作</th></tr>
         </thead>
         <tbody id="aliasBody"></tbody>
       </table>
@@ -1017,6 +1017,30 @@ table.data tbody tr:hover{background:var(--ink-06)}
       
       <button class="btn" data-close-modal>取消</button>
       <button class="btn primary" data-close-modal data-toast="供应商已保存（演示）">保存并测连</button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ 编辑模型别名 弹窗 ═══════════ -->
+<div class="modal-mask" id="aliasModal">
+  <div class="modal" role="dialog" aria-modal="true" aria-label="编辑别名" style="width:520px">
+    <div class="modal-head">
+      <span class="mt" id="aliasModalTitle">编辑别名</span>
+      <span class="me">ALIAS / EDIT</span>
+      <button class="modal-x" data-close-alias-modal>✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="f-label">别名 <span class="req">*</span> <span class="opt">客户端请求时使用的模型名</span></div>
+      <input class="fin" id="aliasEditName" placeholder="例如：GLM-5.3">
+      <div class="f-label">真实模型 <span class="req">*</span> <span class="opt">转发上游时使用的模型名</span></div>
+      <input class="fin" id="aliasEditModel" placeholder="例如：skiff-high">
+      <div class="dim" style="font-size:11.5px;margin-top:12px">
+        修改别名后，客户端需改用新名称请求；目标模型变更即时生效。
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" data-close-alias-modal>取消</button>
+      <button class="btn primary" id="aliasEditSave">保存</button>
     </div>
   </div>
 </div>
